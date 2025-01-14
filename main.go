@@ -144,17 +144,13 @@ func CallGroqAPI(text string) (string, error) {
 }
 
 func Groq(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie("token")
-	if err != nil {
-		if err == http.ErrNoCookie {
-			http.Error(w, "No token provided", http.StatusUnauthorized)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
 		return
 	}
 
-	tokenStr := cookie.Value
+	tokenStr := authHeader[len("Bearer "):]
 	claims := &jwt.StandardClaims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
 		return jwtKey, nil
