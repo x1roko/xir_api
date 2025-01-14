@@ -48,6 +48,7 @@ func main() {
 	http.HandleFunc("/register", Register)
 	http.HandleFunc("/login", Login)
 	http.HandleFunc("/groq", Groq)
+	http.HandleFunc("/refresh-token", RefreshToken) // Новый маршрут для обновления токена
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -175,4 +176,37 @@ func Groq(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(groqResponse))
+}
+
+func RefreshToken(w http.ResponseWriter, r *http.Request) {
+	tokenStr := r.Header.Get("Authorization")
+	if tokenStr == "" {
+		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
+		return
+	}
+
+	tokenStr = tokenStr[len("Bearer "):]
+	claims := &jwt.StandardClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	expirationTime := time.Now().Add(5 * time.Minute)
+	newClaims := &jwt.StandardClaims{
+		ExpiresAt: expirationTime.Unix(),
+	}
+	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
+	newTokenString, err := newToken.SignedString(jwtKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"token": newTokenString})
 }
