@@ -84,7 +84,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expirationTime := time.Now().Add(5 * time.Minute)
+	expirationTime := time.Now().Add(2400 * time.Hour) // 100 дней
 	claims := &jwt.StandardClaims{
 		ExpiresAt: expirationTime.Unix(),
 	}
@@ -196,7 +196,7 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expirationTime := time.Now().Add(5 * time.Minute)
+	expirationTime := time.Now().Add(2400 * time.Hour) // 100 дней
 	newClaims := &jwt.StandardClaims{
 		ExpiresAt: expirationTime.Unix(),
 	}
