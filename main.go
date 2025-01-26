@@ -64,6 +64,7 @@ func main() {
 	http.HandleFunc("/groq", Groq)
 	http.HandleFunc("/refresh-token", RefreshToken)
 	http.HandleFunc("/ws", handleConnections)
+	http.HandleFunc("/messages", loadMessages) // Добавлен маршрут для загрузки сообщений
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -283,4 +284,29 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+func loadMessages(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
+		return
+	}
+
+	tokenStr := authHeader[len("Bearer "):]
+	claims := &jwt.StandardClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	var messages []Message
+	db.Order("created_at desc").Find(&messages)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
 }
