@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -26,6 +27,12 @@ type User struct {
 
 type GroqRequest struct {
 	Text string `json:"text"`
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
 func main() {
@@ -48,7 +55,8 @@ func main() {
 	http.HandleFunc("/register", Register)
 	http.HandleFunc("/login", Login)
 	http.HandleFunc("/groq", Groq)
-	http.HandleFunc("/refresh-token", RefreshToken) // Новый маршрут для обновления токена
+	http.HandleFunc("/refresh-token", RefreshToken)
+	http.HandleFunc("/ws", handleConnections)
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -209,4 +217,28 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": newTokenString})
+}
+
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ws.Close()
+
+	for {
+		_, message, err := ws.ReadMessage()
+		if err != nil {
+			log.Printf("error: %v", err)
+			break
+		}
+		log.Printf("recv: %s", message)
+
+		// Здесь можно добавить логику для обработки сообщений и отправки ответов
+		err = ws.WriteMessage(websocket.TextMessage, message)
+		if err != nil {
+			log.Printf("error: %v", err)
+			break
+		}
+	}
 }
