@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -23,6 +24,12 @@ type User struct {
 	gorm.Model
 	Username string `json:"username" gorm:"unique"`
 	Password string `json:"password"`
+}
+
+type Message struct {
+	gorm.Model
+	Content      string `json:"content"`
+	IsSentByUser bool   `json:"is_sent_by_user"`
 }
 
 type GroqRequest struct {
@@ -50,7 +57,7 @@ func main() {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 
-	db.AutoMigrate(&User{})
+	db.AutoMigrate(&User{}, &Message{})
 
 	http.HandleFunc("/register", Register)
 	http.HandleFunc("/login", Login)
@@ -177,11 +184,29 @@ func Groq(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groqResponse, err := CallGroqAPI(groqReq.Text)
+	// Получение истории сообщений
+	var messages []Message
+	db.Order("created_at desc").Limit(10).Find(&messages)
+
+	// Построение контекста
+	var context strings.Builder
+	for _, msg := range messages {
+		if msg.IsSentByUser {
+			context.WriteString("User: " + msg.Content + "\n")
+		} else {
+			context.WriteString("Bot: " + msg.Content + "\n")
+		}
+	}
+	context.WriteString("User: " + groqReq.Text + "\n")
+
+	groqResponse, err := CallGroqAPI(context.String())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Сохранение ответа в базе данных
+	db.Create(&Message{Content: groqResponse, IsSentByUser: false})
 
 	w.Write([]byte(groqResponse))
 }
