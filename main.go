@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -28,8 +28,9 @@ type User struct {
 
 type Message struct {
 	gorm.Model
-	Content      string `json:"content"`
-	IsSentByUser bool   `json:"is_sent_by_user"`
+	UserID uint   `json:"user_id"`
+	Text   string `json:"text"`
+	IsUser bool   `json:"is_user"` // true для пользователя, false для API
 }
 
 type GroqRequest struct {
@@ -37,6 +38,8 @@ type GroqRequest struct {
 }
 
 var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -62,9 +65,7 @@ func main() {
 	http.HandleFunc("/register", Register)
 	http.HandleFunc("/login", Login)
 	http.HandleFunc("/groq", Groq)
-	http.HandleFunc("/refresh-token", RefreshToken)
-	http.HandleFunc("/ws", handleConnections)
-	http.HandleFunc("/messages", loadMessages) // Добавлен маршрут для загрузки сообщений
+	http.HandleFunc("/refresh-token", RefreshToken) // Новый маршрут для обновления токена
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -103,6 +104,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	expirationTime := time.Now().Add(2400 * time.Hour) // 100 дней
 	claims := &jwt.StandardClaims{
 		ExpiresAt: expirationTime.Unix(),
+		Id:        strconv.FormatUint(uint64(foundUser.ID), 10), // Добавляем ID пользователя в claims
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(jwtKey)
@@ -122,7 +124,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 }
 
-func CallGroqAPI(text string) (string, error) {
+func CallGroqAPI(text string) (<-chan string, <-chan error) {
 	url := "https://api.groq.com/openai/v1/chat/completions"
 	apiKey := os.Getenv("GROQ_API_KEY")
 
@@ -134,12 +136,16 @@ func CallGroqAPI(text string) (string, error) {
 				"content": text,
 			},
 		},
+		"stream": true,
 	}
 
 	jsonValue, _ := json.Marshal(jsonData)
 	request, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonValue))
 	if err != nil {
-		return "", err
+		errChan := make(chan error, 1)
+		errChan <- err
+		close(errChan)
+		return nil, errChan
 	}
 
 	request.Header.Set("Content-Type", "application/json")
@@ -148,19 +154,58 @@ func CallGroqAPI(text string) (string, error) {
 	client := &http.Client{}
 	response, err := client.Do(request)
 	if err != nil {
-		return "", err
+		errChan := make(chan error, 1)
+		errChan <- err
+		close(errChan)
+		return nil, errChan
 	}
-	defer response.Body.Close()
 
-	var result map[string]interface{}
-	body, _ := ioutil.ReadAll(response.Body)
-	json.Unmarshal(body, &result)
+	messageChan := make(chan string)
+	errChan := make(chan error, 1)
 
-	content := result["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string)
-	return content, nil
+	go func() {
+		defer response.Body.Close()
+		scanner := bufio.NewScanner(response.Body)
+		var responseBuffer bytes.Buffer
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" || line == "data: [DONE]" {
+				continue
+			}
+
+			// Убираем префикс "data: " и пытаемся распарсить JSON
+			line = line[len("data: "):]
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+				log.Printf("Error parsing JSON: %v", err)
+				continue
+			}
+
+			// Извлекаем содержимое "delta.content"
+			choices := parsed["choices"].([]interface{})
+			if len(choices) > 0 {
+				delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
+				if content, ok := delta["content"].(string); ok {
+					responseBuffer.WriteString(content)
+					messageChan <- content
+				}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			errChan <- err
+		}
+
+		close(messageChan)
+		close(errChan)
+	}()
+
+	return messageChan, errChan
 }
 
 func Groq(w http.ResponseWriter, r *http.Request) {
+	// Extract the Authorization header
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
@@ -178,38 +223,89 @@ func Groq(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var groqReq GroqRequest
-	err = json.NewDecoder(r.Body).Decode(&groqReq)
+	userID, err := strconv.ParseUint(claims.Id, 10, 64)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "Invalid user ID in token", http.StatusUnauthorized)
 		return
 	}
 
-	// Получение истории сообщений
-	var messages []Message
-	db.Order("created_at desc").Limit(10).Find(&messages)
-
-	// Построение контекста
-	var context strings.Builder
-	for _, msg := range messages {
-		if msg.IsSentByUser {
-			context.WriteString("User: " + msg.Content + "\n")
-		} else {
-			context.WriteString("Bot: " + msg.Content + "\n")
-		}
-	}
-	context.WriteString("User: " + groqReq.Text + "\n")
-
-	groqResponse, err := CallGroqAPI(context.String())
+	// Upgrade the HTTP connection to a WebSocket connection
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Сохранение ответа в базе данных
-	db.Create(&Message{Content: groqResponse, IsSentByUser: false})
+	log.Println("WebSocket connection established")
 
-	w.Write([]byte(groqResponse))
+	// Основной канал для обработки соединения
+	done := make(chan struct{})
+
+	// Чтение сообщений из WebSocket в отдельной горутине
+	go func() {
+		defer func() {
+			close(done)
+			conn.Close() // Закрываем соединение, когда горутина завершится
+			log.Println("WebSocket connection closed")
+		}()
+
+		for {
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("Connection error or closed by client: %v", err)
+				return
+			}
+
+			// Проверяем, хочет ли пользователь закрыть соединение
+			if string(message) == "close" {
+				log.Println("Client requested connection close")
+				conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Connection closed by user"))
+				return
+			}
+
+			if messageType == websocket.TextMessage {
+				var groqReq GroqRequest
+				if err := json.Unmarshal(message, &groqReq); err != nil {
+					log.Printf("Invalid JSON: %v", err)
+					continue
+				}
+
+				log.Printf("Received message: %v", groqReq)
+
+				// Сохраняем сообщение от пользователя
+				userMessage := Message{
+					UserID: uint(userID),
+					Text:   groqReq.Text,
+					IsUser: true,
+				}
+				db.Create(&userMessage)
+
+				messageChan, errChan := CallGroqAPI(groqReq.Text)
+
+				// Передача сообщений от API в WebSocket
+				go func() {
+					for msg := range messageChan {
+						err := conn.WriteMessage(websocket.TextMessage, []byte(msg))
+						if err != nil {
+							log.Printf("Error writing message: %v", err)
+							return
+						}
+					}
+				}()
+
+				// Обрабатываем возможные ошибки из API
+				go func() {
+					if err := <-errChan; err != nil {
+						log.Printf("Error from API: %v", err)
+						conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
+					}
+				}()
+			}
+		}
+	}()
+
+	// Блокируем выполнение функции, пока соединение не будет закрыто
+	<-done
 }
 
 func RefreshToken(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +329,7 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 	expirationTime := time.Now().Add(2400 * time.Hour) // 100 дней
 	newClaims := &jwt.StandardClaims{
 		ExpiresAt: expirationTime.Unix(),
+		Id:        claims.Id, // Сохраняем ID пользователя в новом токене
 	}
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
 	newTokenString, err := newToken.SignedString(jwtKey)
@@ -243,70 +340,4 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": newTokenString})
-}
-
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
-		return
-	}
-
-	tokenStr := authHeader[len("Bearer "):]
-	claims := &jwt.StandardClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-		return jwtKey, nil
-	})
-
-	if err != nil || !token.Valid {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ws.Close()
-
-	for {
-		_, message, err := ws.ReadMessage()
-		if err != nil {
-			log.Printf("error: %v", err)
-			break
-		}
-		log.Printf("recv: %s", message)
-
-		// Здесь можно добавить логику для обработки сообщений и отправки ответов
-		err = ws.WriteMessage(websocket.TextMessage, message)
-		if err != nil {
-			log.Printf("error: %v", err)
-			break
-		}
-	}
-}
-
-func loadMessages(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
-		return
-	}
-
-	tokenStr := authHeader[len("Bearer "):]
-	claims := &jwt.StandardClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-		return jwtKey, nil
-	})
-
-	if err != nil || !token.Valid {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	var messages []Message
-	db.Order("created_at desc").Find(&messages)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(messages)
 }
