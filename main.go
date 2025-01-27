@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -124,19 +125,32 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 }
 
-func CallGroqAPI(text string) (<-chan string, <-chan error) {
+func CallGroqAPI(text string, history []Message) (<-chan string, <-chan error) {
 	url := "https://api.groq.com/openai/v1/chat/completions"
 	apiKey := os.Getenv("GROQ_API_KEY")
 
+	var messages []map[string]string
+	for _, msg := range history {
+		role := "user"
+		if !msg.IsUser {
+			role = "assistant"
+		}
+		messages = append(messages, map[string]string{
+			"role":    role,
+			"content": msg.Text,
+		})
+	}
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": text,
+	})
+
 	jsonData := map[string]interface{}{
-		"model": "llama-3.3-70b-versatile",
-		"messages": []map[string]string{
-			{
-				"role":    "user",
-				"content": text,
-			},
-		},
-		"stream": true,
+		"model":            "llama-3.3-70b-versatile",
+		"messages":         messages,
+		"stream":           true,
+		"temperature":      0.7, // Устанавливаем температуру для более чётких ответов
+		"presence_penalty": 0.5, // Устанавливаем presence_penalty для уменьшения повторений
 	}
 
 	jsonValue, _ := json.Marshal(jsonData)
@@ -280,11 +294,20 @@ func Groq(w http.ResponseWriter, r *http.Request) {
 				}
 				db.Create(&userMessage)
 
-				messageChan, errChan := CallGroqAPI(groqReq.Text)
+				// Извлекаем историю сообщений
+				var history []Message
+				db.Where("user_id = ?", userID).Order("created_at asc").Find(&history)
+
+				var wg sync.WaitGroup
+				var fullResponse string
+				messageChan, errChan := CallGroqAPI(groqReq.Text, history)
 
 				// Передача сообщений от API в WebSocket
+				wg.Add(1)
 				go func() {
+					defer wg.Done()
 					for msg := range messageChan {
+						fullResponse += msg
 						err := conn.WriteMessage(websocket.TextMessage, []byte(msg))
 						if err != nil {
 							log.Printf("Error writing message: %v", err)
@@ -294,12 +317,25 @@ func Groq(w http.ResponseWriter, r *http.Request) {
 				}()
 
 				// Обрабатываем возможные ошибки из API
+				wg.Add(1)
 				go func() {
+					defer wg.Done()
 					if err := <-errChan; err != nil {
 						log.Printf("Error from API: %v", err)
 						conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
 					}
 				}()
+
+				// Ожидаем завершения всех горутин
+				wg.Wait()
+
+				// Сохраняем полный ответ API в базу данных
+				apiMessage := Message{
+					UserID: uint(userID),
+					Text:   fullResponse,
+					IsUser: false,
+				}
+				db.Create(&apiMessage)
 			}
 		}
 	}()
