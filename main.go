@@ -66,7 +66,8 @@ func main() {
 	http.HandleFunc("/register", Register)
 	http.HandleFunc("/login", Login)
 	http.HandleFunc("/groq", Groq)
-	http.HandleFunc("/refresh-token", RefreshToken) // Новый маршрут для обновления токена
+	http.HandleFunc("/refresh-token", RefreshToken)
+	http.HandleFunc("/messages", GetMessages) // Новый маршрут для получения сообщений
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -376,4 +377,35 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": newTokenString})
+}
+
+func GetMessages(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
+		return
+	}
+
+	tokenStr := authHeader[len("Bearer "):]
+	claims := &jwt.StandardClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	userID, err := strconv.ParseUint(claims.Id, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid user ID in token", http.StatusUnauthorized)
+		return
+	}
+
+	var messages []Message
+	db.Where("user_id = ?", userID).Order("created_at asc").Find(&messages)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(messages)
 }
