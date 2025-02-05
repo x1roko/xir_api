@@ -7,6 +7,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    volumes:
+    - ./images:/app/images
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - DB_USER=${DB_USER}

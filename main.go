@@ -3,11 +3,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +40,28 @@ type Message struct {
 
 type GroqRequest struct {
 	Text string `json:"text"`
+}
+
+type KandinskyRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model"`
+	Images         int    `json:"images"`
+	Width          int    `json:"width"`
+	Height         int    `json:"height"`
+	Style          string `json:"style"`
+	NegativePrompt string `json:"negativePrompt"`
+}
+
+type KandinskyResponse struct {
+	UUID string `json:"uuid"`
+}
+
+type CheckStatusResponse struct {
+	UUID             string   `json:"uuid"`
+	Status           string   `json:"status"`
+	Images           []string `json:"images"`
+	ErrorDescription string   `json:"errorDescription"`
+	Censored         bool     `json:"censored"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -68,6 +94,7 @@ func main() {
 	http.HandleFunc("/groq", Groq)
 	http.HandleFunc("/refresh-token", RefreshToken)
 	http.HandleFunc("/messages", GetMessages) // Новый маршрут для получения сообщений
+	http.HandleFunc("/generate-image", GenerateImage)
 
 	log.Println("Server started at 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -408,4 +435,207 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(messages)
+}
+
+func GenerateImage(w http.ResponseWriter, r *http.Request) {
+	// Extract the Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
+		return
+	}
+
+	tokenStr := authHeader[len("Bearer "):]
+	claims := &jwt.StandardClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	var kandinskyReq KandinskyRequest
+	err = json.NewDecoder(r.Body).Decode(&kandinskyReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	uuid, err := callKandinskyAPI(kandinskyReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ожидание завершения генерации изображения
+	images, err := waitForGenerationCompletion(uuid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(images)
+}
+
+func waitForGenerationCompletion(uuid string) ([]string, error) {
+	const maxAttempts = 10
+	const delay = 5 * time.Second
+
+	for i := 0; i < maxAttempts; i++ {
+		images, err := checkGenerationStatus(uuid)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(images) > 0 {
+			return images, nil
+		}
+
+		time.Sleep(delay)
+	}
+
+	return nil, fmt.Errorf("generation failed after %d attempts", maxAttempts)
+}
+
+func callKandinskyAPI(req KandinskyRequest) (string, error) {
+	url := "https://api-key.fusionbrain.ai/key/api/v1/text2image/run"
+	apiKey := os.Getenv("KANDINSKY_API_KEY")
+	secretKey := os.Getenv("KANDINSKY_SECRET_KEY")
+
+	// Формируем JSON-параметры
+	params := map[string]interface{}{
+		"type":      "GENERATE",
+		"numImages": req.Images,
+		"width":     req.Width,
+		"height":    req.Height,
+		"generateParams": map[string]interface{}{
+			"query": req.Prompt,
+		},
+	}
+	if req.Style != "" {
+		params["style"] = req.Style
+	}
+	if req.NegativePrompt != "" {
+		params["negativePromptUnclip"] = req.NegativePrompt
+	}
+
+	// Кодируем параметры в JSON
+	jsonValue, err := json.Marshal(params)
+	if err != nil {
+		return "", err
+	}
+
+	// Создаем уникальную границу (boundary)
+	boundary := "----WebKitFormBoundary" + strings.ReplaceAll(fmt.Sprintf("%x", os.Getpid()), "-", "")
+
+	// Формируем тело запроса
+	var body bytes.Buffer
+	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	body.WriteString("Content-Disposition: form-data; name=\"model_id\"\r\n\r\n")
+	body.WriteString(req.Model + "\r\n")
+	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+	body.WriteString("Content-Disposition: form-data; name=\"params\"\r\n")
+	body.WriteString("Content-Type: application/json\r\n\r\n")
+	body.WriteString(string(jsonValue) + "\r\n")
+	body.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
+
+	// Создаём HTTP-запрос
+	request, err := http.NewRequest("POST", url, &body)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	request.Header.Set("X-Key", "Key "+apiKey)
+	request.Header.Set("X-Secret", "Secret "+secretKey)
+
+	// Отправляем запрос
+	client := &http.Client{}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	// Читаем ответ
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", err
+	}
+	log.Printf("Full Kandinsky API Response: %s", string(responseBody))
+
+	// Декодируем JSON-ответ
+	var generateResponse KandinskyResponse
+	if err := json.Unmarshal(responseBody, &generateResponse); err != nil {
+		return "", err
+	}
+
+	return generateResponse.UUID, nil
+}
+
+func checkGenerationStatus(uuid string) ([]string, error) {
+	url := fmt.Sprintf("https://api-key.fusionbrain.ai/key/api/v1/text2image/status/%s", uuid)
+	apiKey := os.Getenv("KANDINSKY_API_KEY")
+	secretKey := os.Getenv("KANDINSKY_SECRET_KEY")
+
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("X-Key", "Key "+apiKey)
+	request.Header.Set("X-Secret", "Secret "+secretKey)
+
+	client := &http.Client{}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+
+	var statusResponse CheckStatusResponse
+	if err := json.NewDecoder(response.Body).Decode(&statusResponse); err != nil {
+		return nil, err
+	}
+
+	log.Printf("Kandinsky Status Response: %+v", statusResponse)
+
+	if statusResponse.Status == "DONE" {
+		// Сохраняем изображения в монтируемую папку
+		for i, imageData := range statusResponse.Images {
+			filename := fmt.Sprintf("/app/images/image_%s_%d.png", uuid, i)
+			if err := saveBase64Image(imageData, filename); err != nil {
+				return nil, err
+			}
+		}
+		return statusResponse.Images, nil
+	}
+
+	return nil, nil
+}
+
+func saveBase64Image(base64String, filename string) error {
+	// Удаляем префикс "data:image/png;base64,"
+	base64Data := strings.Replace(base64String, "data:image/png;base64,", "", 1)
+
+	// Декодируем Base64
+	imageData, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return err
+	}
+
+	// Сохраняем изображение в файл
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, strings.NewReader(string(imageData)))
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
