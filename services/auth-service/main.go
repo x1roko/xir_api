@@ -24,6 +24,27 @@ type User struct {
 	Password string `json:"password"`
 }
 
+// enableCors enables CORS for a specific response
+func enableCors(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+}
+
+// CORS middleware
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enableCors(&w)
+		
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -41,41 +62,50 @@ func main() {
 	db.AutoMigrate(&User{})
 
 	router := mux.NewRouter()
-	router.HandleFunc("/register", Register).Methods("POST")
-	router.HandleFunc("/login", Login).Methods("POST")
-	router.HandleFunc("/refresh-token", RefreshToken).Methods("POST")
+	router.Use(corsMiddleware)
+	
+	router.HandleFunc("/register", Register).Methods("POST", "OPTIONS")
+	router.HandleFunc("/login", Login).Methods("POST", "OPTIONS")
+	router.HandleFunc("/refresh-token", RefreshToken).Methods("POST", "OPTIONS")
 
 	log.Println("Auth Service started at 0.0.0.0:8081")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8081", router))
 }
 
 func Register(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	w.Header().Set("Content-Type", "application/json")
+
 	var user User
 	err := json.NewDecoder(r.Body).Decode(&user)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	result := db.Create(&user)
 	if result.Error != nil {
-		http.Error(w, "User already exists", http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "User already exists"})
 		return
 	}
-	w.Write([]byte("Registration successful"))
+	json.NewEncoder(w).Encode(map[string]string{"message": "Registration successful"})
 }
 
 func Login(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	w.Header().Set("Content-Type", "application/json")
+
 	var user User
 	err := json.NewDecoder(r.Body).Decode(&user)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
 	var foundUser User
 	result := db.Where("username = ? AND password = ?", user.Username, user.Password).First(&foundUser)
 	if result.Error != nil {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid credentials"})
 		return
 	}
 
@@ -87,24 +117,28 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(jwtKey)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:    "token",
-		Value:   tokenString,
-		Expires: expirationTime,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token": tokenString,
+		"status": "success",
+		"user": map[string]interface{}{
+			"id": foundUser.ID,
+			"username": foundUser.Username,
+		},
 	})
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 }
 
 func RefreshToken(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	w.Header().Set("Content-Type", "application/json")
+
 	tokenStr := r.Header.Get("Authorization")
 	if tokenStr == "" {
-		http.Error(w, "Authorization header not found", http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Authorization header not found"})
 		return
 	}
 
@@ -115,7 +149,7 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil || !token.Valid {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid token"})
 		return
 	}
 
@@ -127,10 +161,9 @@ func RefreshToken(w http.ResponseWriter, r *http.Request) {
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
 	newTokenString, err := newToken.SignedString(jwtKey)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": newTokenString})
 }

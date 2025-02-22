@@ -14,6 +14,7 @@ import (
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
 
@@ -21,7 +22,7 @@ var jwtKey []byte
 
 type KandinskyRequest struct {
 	Prompt         string `json:"prompt"`
-	Model          string `json:"model"`
+	Model          int    `json:"model"`
 	Images         int    `json:"images"`
 	Width          int    `json:"width"`
 	Height         int    `json:"height"`
@@ -41,6 +42,22 @@ type CheckStatusResponse struct {
 	Censored         bool     `json:"censored"`
 }
 
+type WebSocketMessage struct {
+	Type   string           `json:"type"`
+	Status string           `json:"status"`
+	Data   KandinskyRequest `json:"data,omitempty"`
+	Image  string           `json:"image,omitempty"`
+	Error  string           `json:"error,omitempty"`
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Разрешаем подключения с любых источников
+	},
+}
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -51,6 +68,7 @@ func main() {
 
 	router := mux.NewRouter()
 	router.HandleFunc("/generate-image", GenerateImage).Methods("POST")
+	router.HandleFunc("/ws/generate-image", HandleWebSocketImageGeneration)
 
 	log.Println("Image Service started at 0.0.0.0:8083")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8083", router))
@@ -148,7 +166,7 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 	var body bytes.Buffer
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	body.WriteString("Content-Disposition: form-data; name=\"model_id\"\r\n\r\n")
-	body.WriteString(req.Model + "\r\n")
+	body.WriteString(fmt.Sprintf("%d", req.Model) + "\r\n")
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	body.WriteString("Content-Disposition: form-data; name=\"params\"\r\n")
 	body.WriteString("Content-Type: application/json\r\n\r\n")
@@ -243,4 +261,116 @@ func saveBase64Image(base64String, filename string) error {
 	}
 
 	return nil
+}
+
+func HandleWebSocketImageGeneration(w http.ResponseWriter, r *http.Request) {
+	// Получаем токен из URL параметров
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Missing token", http.StatusUnauthorized)
+		return
+	}
+
+	// Проверяем JWT токен
+	claims := &jwt.StandardClaims{}
+	parsedToken, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !parsedToken.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// Upgrade HTTP connection to WebSocket только после успешной авторизации
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Error upgrading to WebSocket: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	for {
+		// Read message from client
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
+			break
+		}
+
+		// Parse the request
+		var wsMessage WebSocketMessage
+		if err := json.Unmarshal(message, &wsMessage); err != nil {
+			sendError(conn, "Invalid message format")
+			continue
+		}
+
+		// Handle image generation request
+		if wsMessage.Type == "generate" {
+			go handleImageGeneration(conn, wsMessage.Data)
+		}
+	}
+}
+
+func handleImageGeneration(conn *websocket.Conn, req KandinskyRequest) {
+	// Send "generating" status
+	sendStatus(conn, "generating")
+
+	// Call Kandinsky API
+	uuid, err := callKandinskyAPI(req)
+	if err != nil {
+		sendError(conn, fmt.Sprintf("Error calling Kandinsky API: %v", err))
+		return
+	}
+
+	// Wait for and check generation status
+	const maxAttempts = 20
+	const delay = 3 * time.Second
+
+	for i := 0; i < maxAttempts; i++ {
+		images, err := checkGenerationStatus(uuid)
+		if err != nil {
+			sendError(conn, fmt.Sprintf("Error checking generation status: %v", err))
+			return
+		}
+
+		if len(images) > 0 {
+			// Send the generated image
+			response := WebSocketMessage{
+				Type:   "result",
+				Status: "completed",
+				Image:  images[0],
+			}
+			if err := conn.WriteJSON(response); err != nil {
+				log.Printf("Error sending image: %v", err)
+			}
+			return
+		}
+
+		time.Sleep(delay)
+	}
+
+	sendError(conn, "Generation timed out")
+}
+
+func sendStatus(conn *websocket.Conn, status string) {
+	response := WebSocketMessage{
+		Type:   "status",
+		Status: status,
+	}
+	if err := conn.WriteJSON(response); err != nil {
+		log.Printf("Error sending status: %v", err)
+	}
+}
+
+func sendError(conn *websocket.Conn, errorMsg string) {
+	response := WebSocketMessage{
+		Type:  "error",
+		Error: errorMsg,
+	}
+	if err := conn.WriteJSON(response); err != nil {
+		log.Printf("Error sending error message: %v", err)
+	}
 }

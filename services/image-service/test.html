@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Image Generation Test</title>
+    <style>
+        #status, #error, #authStatus {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        #status {
+            background-color: #e8f5e9;
+        }
+        #error {
+            background-color: #ffebee;
+            color: red;
+        }
+        #authStatus.success {
+            background-color: #e8f5e9;
+            color: green;
+        }
+        #authStatus.error {
+            background-color: #ffebee;
+            color: red;
+        }
+        #generatedImage {
+            max-width: 512px;
+            margin-top: 20px;
+        }
+        .form-group {
+            margin: 10px 0;
+        }
+        label {
+            display: inline-block;
+            width: 120px;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        input {
+            padding: 6px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <h2>Authentication</h2>
+        <div class="form-group">
+            <label for="username">Username:</label>
+            <input type="text" id="username" value="testuser">
+        </div>
+        <div class="form-group">
+            <label for="password">Password:</label>
+            <input type="password" id="password" value="testpass">
+        </div>
+        <button onclick="login()">Login</button>
+        <div id="authStatus"></div>
+    </div>
+
+    <div class="section">
+        <h2>Image Generation</h2>
+        <div class="form-group">
+            <label for="prompt">Prompt:</label>
+            <input type="text" id="prompt" value="a beautiful landscape with mountains" style="width: 300px;">
+        </div>
+        
+        <div class="form-group">
+            <label for="negativePrompt">Negative Prompt:</label>
+            <input type="text" id="negativePrompt" value="ugly, blurry" style="width: 300px;">
+        </div>
+        
+        <div class="form-group">
+            <label for="width">Width:</label>
+            <input type="number" id="width" value="512">
+        </div>
+        
+        <div class="form-group">
+            <label for="height">Height:</label>
+            <input type="number" id="height" value="512">
+        </div>
+        
+        <div class="form-group">
+            <label for="style">Style:</label>
+            <input type="text" id="style" value="KANDINSKY">
+        </div>
+        
+        <button onclick="generateImage()" id="generateBtn" disabled>Generate Image</button>
+        
+        <div id="status"></div>
+        <div id="error"></div>
+        <img id="generatedImage" style="display: none;">
+    </div>
+
+    <script>
+        let ws;
+        let jwtToken = '';
+
+        async function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const authStatus = document.getElementById('authStatus');
+            
+            try {
+                const response = await fetch('http://localhost:8081/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        username: username,
+                        password: password
+                    })
+                });
+
+                const data = await response.json();
+                console.log('Login response:', data);
+                
+                if (data.token && data.status === 'success') {
+                    jwtToken = data.token;
+                    authStatus.textContent = `Authenticated successfully! Welcome, ${data.user.username}`;
+                    authStatus.className = 'success';
+                    document.getElementById('generateBtn').disabled = false;
+                    
+                    // Сразу подключаемся к WebSocket после успешной аутентификации
+                    connectWebSocket();
+                } else {
+                    authStatus.textContent = 'Authentication failed: ' + (data.error || 'Unknown error');
+                    authStatus.className = 'error';
+                    document.getElementById('generateBtn').disabled = true;
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                authStatus.textContent = 'Network error. Please check if the auth service is running.';
+                authStatus.className = 'error';
+                document.getElementById('generateBtn').disabled = true;
+            }
+        }
+
+        function connectWebSocket() {
+            if (!jwtToken) {
+                document.getElementById('error').textContent = 'Please login first';
+                return null;
+            }
+
+            // Добавляем токен в URL для WebSocket
+            const wsUrl = `ws://localhost:8083/ws/generate-image?token=${jwtToken}`;
+            console.log('Connecting to WebSocket:', wsUrl);
+            
+            try {
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function() {
+                    console.log('Connected to WebSocket');
+                    document.getElementById('error').textContent = '';
+                };
+                
+                ws.onmessage = function(event) {
+                    const response = JSON.parse(event.data);
+                    console.log('Received:', response);
+                    
+                    if (response.type === 'status') {
+                        document.getElementById('status').textContent = 'Status: ' + response.status;
+                        document.getElementById('error').textContent = '';
+                    } else if (response.type === 'error') {
+                        document.getElementById('error').textContent = 'Error: ' + response.error;
+                    } else if (response.type === 'result') {
+                        document.getElementById('status').textContent = 'Status: ' + response.status;
+                        const img = document.getElementById('generatedImage');
+                        img.src = 'data:image/jpeg;base64,' + response.image;
+                        img.style.display = 'block';
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket Error:', error);
+                    document.getElementById('error').textContent = 'WebSocket Error: ' + error;
+                };
+                
+                ws.onclose = function(event) {
+                    console.log('WebSocket Connection Closed:', event);
+                    document.getElementById('error').textContent = 'WebSocket connection closed. Please try again.';
+                };
+
+                return ws;
+            } catch (error) {
+                console.error('WebSocket connection error:', error);
+                document.getElementById('error').textContent = 'Failed to connect to WebSocket: ' + error.message;
+                return null;
+            }
+        }
+
+        function generateImage() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                ws = connectWebSocket();
+                if (!ws) return;
+                setTimeout(sendGenerateRequest, 1000); // Wait for connection
+                return;
+            }
+            sendGenerateRequest();
+        }
+
+        function sendGenerateRequest() {
+            const request = {
+                type: 'generate',
+                data: {
+                    prompt: document.getElementById('prompt').value,
+                    negativePrompt: document.getElementById('negativePrompt').value,
+                    width: parseInt(document.getElementById('width').value),
+                    height: parseInt(document.getElementById('height').value),
+                    style: document.getElementById('style').value,
+                    model: 4,
+                    images: 1
+                }
+            };
+            
+            try {
+                ws.send(JSON.stringify(request));
+                document.getElementById('status').textContent = 'Connecting to service...';
+                document.getElementById('error').textContent = '';
+                document.getElementById('generatedImage').style.display = 'none';
+            } catch (error) {
+                console.error('Error sending request:', error);
+                document.getElementById('error').textContent = 'Failed to send request: ' + error.message;
+            }
+        }
+    </script>
+</body>
+</html>
