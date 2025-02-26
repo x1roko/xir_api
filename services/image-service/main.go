@@ -64,15 +64,26 @@ type Message struct {
 	UserID      uint    `gorm:"index"`
 	Prompt      string  `json:"prompt"`
 	IsGenerated bool    `json:"is_generated"`
-	Images      []Image `gorm:"foreignKey:MessageID"`
 	CreatedAt   time.Time
 }
 
 type Image struct {
-	Filename  string `gorm:"primaryKey" json:"filename"`
-	MessageID uint   `gorm:"index" json:"message_id"`
-	Status    string `json:"status"`
-	CreatedAt time.Time
+	Filename    string `gorm:"primaryKey" json:"filename"`
+	UserID      uint   `gorm:"index" json:"user_id"`
+	Prompt      string `json:"prompt"`
+	IsUser      bool   `json:"is_user"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	Style       string `json:"style"`
+	NegativePrompt string `json:"negative_prompt"`
+	Status      string `json:"status"`
+	CreatedAt   time.Time
+}
+
+type DialogHistoryItem struct {
+	UserRequest Image   `json:"user_request"`
+	SystemImage Image   `json:"system_image"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -174,44 +185,37 @@ func GenerateImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Создаем запись о сообщении
-	message := Message{
-		UserID:      uint(userID),
-		Prompt:      kandinskyReq.Prompt,
-		IsGenerated: false,
-	}
-	db.Create(&message)
-
 	uuid, err := callKandinskyAPI(kandinskyReq)
 	if err != nil {
-		message.IsGenerated = false
-		db.Save(&message)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	images, err := waitForGenerationCompletion(uuid)
 	if err != nil {
-		message.IsGenerated = false
-		db.Save(&message)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Сохраняем изображения с уникальными именами файлов
+	// Сохраняем изображения
 	var savedImages []string
-	for _, base64Image := range images {
-		// Генерируем уникальное имя файла
-		filename := fmt.Sprintf("%s_%d.png", uuid, time.Now().UnixNano())
-
-		// Сохраняем файл на диск
+	for idx, base64Image := range images {
+		filename := fmt.Sprintf("image_%s_%d_%d.png", uuid, time.Now().UnixNano(), idx)
+		
 		imagePath := filepath.Join(os.Getenv("IMAGES_STORAGE_PATH"), filename)
-		imageData, err := base64.StdEncoding.DecodeString(strings.Split(base64Image, ",")[1])
+		
+		// Удаляем префикс base64, если он есть
+		base64Data := base64Image
+		if strings.Contains(base64Image, ",") {
+			base64Data = strings.Split(base64Image, ",")[1]
+		}
+		
+		imageData, err := base64.StdEncoding.DecodeString(base64Data)
 		if err != nil {
 			log.Printf("Error decoding base64 image: %v", err)
 			continue
 		}
-
+		
 		err = os.WriteFile(imagePath, imageData, 0644)
 		if err != nil {
 			log.Printf("Error saving image file: %v", err)
@@ -220,20 +224,131 @@ func GenerateImage(w http.ResponseWriter, r *http.Request) {
 
 		// Создаем запись в базе данных
 		img := Image{
-			Filename:  filename,
-			MessageID: message.ID,
-			Status:    "generated",
+			Filename:        filename,
+			UserID:          uint(userID),
+			Prompt:          kandinskyReq.Prompt,
+			IsUser:          true,
+			Width:           kandinskyReq.Width,
+			Height:          kandinskyReq.Height,
+			Style:           kandinskyReq.Style,
+			NegativePrompt:  kandinskyReq.NegativePrompt,
+			Status:          "generated",
 		}
 		db.Create(&img)
 
 		savedImages = append(savedImages, filename)
 	}
 
-	message.IsGenerated = true
-	db.Save(&message)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(savedImages)
+}
+
+func HandleWebSocketImageGeneration(w http.ResponseWriter, r *http.Request) {
+	// Получаем UserID из контекста
+	userID := r.Context().Value("userID").(string)
+	userIDUint, err := strconv.ParseUint(userID, 10, 32)
+	if err != nil {
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	for {
+		var msg WebSocketMessage
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("WebSocket read error: %v", err)
+			break
+		}
+
+		switch msg.Type {
+		case "generate":
+			// Генерируем изображение через Kandinsky API
+			uuid, err := callKandinskyAPI(msg.Data)
+			if err != nil {
+				conn.WriteJSON(WebSocketMessage{
+					Type:  "error",
+					Error: "Failed to generate image: " + err.Error(),
+				})
+				continue
+			}
+
+			// Ожидаем завершения генерации
+			images, err := waitForGenerationCompletion(uuid)
+			if err != nil {
+				conn.WriteJSON(WebSocketMessage{
+					Type:  "error",
+					Error: "Image generation failed: " + err.Error(),
+				})
+				continue
+			}
+
+			// Сохраняем изображения
+			var savedImages []string
+			for idx, base64Image := range images {
+				filename := fmt.Sprintf("image_%s_%d_%d.png", uuid, time.Now().UnixNano(), idx)
+				
+				imagePath := filepath.Join(os.Getenv("IMAGES_STORAGE_PATH"), filename)
+				
+				// Удаляем префикс base64, если он есть
+				base64Data := base64Image
+				if strings.Contains(base64Image, ",") {
+					base64Data = strings.Split(base64Image, ",")[1]
+				}
+				
+				imageData, err := base64.StdEncoding.DecodeString(base64Data)
+				if err != nil {
+					log.Printf("Error decoding base64 image: %v", err)
+					continue
+				}
+				
+				err = os.WriteFile(imagePath, imageData, 0644)
+				if err != nil {
+					log.Printf("Error saving image file: %v", err)
+					continue
+				}
+
+				// Создаем запись в базе данных
+				img := Image{
+					Filename:        filename,
+					UserID:          uint(userIDUint),
+					Prompt:          msg.Data.Prompt,
+					IsUser:          false, // Сгенерировано системой
+					Width:           msg.Data.Width,
+					Height:          msg.Data.Height,
+					Style:           msg.Data.Style,
+					NegativePrompt:  msg.Data.NegativePrompt,
+					Status:          "generated",
+				}
+				db.Create(&img)
+
+				savedImages = append(savedImages, filename)
+			}
+
+			// Отправляем результат обратно клиенту
+			err = conn.WriteJSON(WebSocketMessage{
+				Type:   "result",
+				Status: "success",
+				Data:   msg.Data,
+				Image:  savedImages[0], // Отправляем первое изображение
+			})
+			if err != nil {
+				log.Printf("Error sending WebSocket message: %v", err)
+			}
+
+		default:
+			conn.WriteJSON(WebSocketMessage{
+				Type:  "error",
+				Error: "Unknown message type",
+			})
+		}
+	}
 }
 
 func GetMessageHistory(w http.ResponseWriter, r *http.Request) {
@@ -260,22 +375,38 @@ func GetMessageHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var messages []Message
-	result := db.Where("user_id = ?", userID).Order("created_at DESC").Find(&messages)
+	// Получаем все изображения пользователя
+	var userImages []Image
+	result := db.Where("user_id = ?", userID).Order("created_at DESC").Find(&userImages)
 	if result.Error != nil {
-		http.Error(w, "Failed to retrieve messages", http.StatusInternalServerError)
+		http.Error(w, "Failed to retrieve images", http.StatusInternalServerError)
 		return
 	}
 
-	// Загружаем изображения для каждого сообщения
-	for i := range messages {
-		var images []Image
-		db.Where("message_id = ?", messages[i].ID).Find(&images)
-		messages[i].Images = images
+	// Группируем изображения по диалогам
+	dialogHistory := []DialogHistoryItem{}
+	for i := 0; i < len(userImages); i++ {
+		// Находим запрос пользователя (is_user = true)
+		if userImages[i].IsUser {
+			userRequest := userImages[i]
+			
+			// Ищем соответствующее изображение, сгенерированное системой
+			var systemImage Image
+			systemResult := db.Where("user_id = ? AND is_user = ? AND created_at > ? AND created_at < ?", 
+				userID, false, userRequest.CreatedAt, userRequest.CreatedAt.Add(5*time.Minute)).First(&systemImage)
+			
+			if systemResult.Error == nil {
+				dialogHistory = append(dialogHistory, DialogHistoryItem{
+					UserRequest: userRequest,
+					SystemImage: systemImage,
+					CreatedAt:   userRequest.CreatedAt,
+				})
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(messages)
+	json.NewEncoder(w).Encode(dialogHistory)
 }
 
 func waitForGenerationCompletion(uuid string) ([]string, error) {
@@ -426,164 +557,6 @@ func saveBase64Image(base64String, filename string) error {
 	}
 
 	return nil
-}
-
-func HandleWebSocketImageGeneration(w http.ResponseWriter, r *http.Request) {
-	// Получаем UserID из контекста
-	userID := r.Context().Value("userID").(string)
-	userIDUint, err := strconv.ParseUint(userID, 10, 32)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// Настройка WebSocket с более строгими параметрами
-	upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // В production нужно ограничить
-		},
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	// Канал для завершения горутины
-	done := make(chan struct{})
-	defer close(done)
-
-	// Горутина для чтения сообщений
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				var msg WebSocketMessage
-				err := conn.ReadJSON(&msg)
-				if err != nil {
-					log.Printf("WebSocket read error: %v", err)
-					conn.Close()
-					return
-				}
-
-				switch msg.Type {
-				case "generate":
-					// Создаем запись о сообщении
-					message := Message{
-						UserID:      uint(userIDUint),
-						Prompt:      msg.Data.Prompt,
-						IsGenerated: false,
-					}
-					db.Create(&message)
-
-					// Генерируем изображение через Kandinsky API
-					uuid, err := callKandinskyAPI(msg.Data)
-					if err != nil {
-						conn.WriteJSON(WebSocketMessage{
-							Type:  "error",
-							Error: "Failed to generate image: " + err.Error(),
-						})
-						continue
-					}
-
-					// Ожидаем завершения генерации
-					images, err := waitForGenerationCompletion(uuid)
-					if err != nil {
-						conn.WriteJSON(WebSocketMessage{
-							Type:  "error",
-							Error: "Image generation failed: " + err.Error(),
-						})
-						continue
-					}
-
-					// Сохраняем изображения
-					var savedImages []string
-					for idx, base64Image := range images {
-						filename := fmt.Sprintf("image_%s_%d_%d.png", uuid, time.Now().UnixNano(), idx)
-						
-						imagePath := filepath.Join(os.Getenv("IMAGES_STORAGE_PATH"), filename)
-						
-						// Удаляем префикс base64, если он есть
-						base64Data := base64Image
-						if strings.Contains(base64Image, ",") {
-							base64Data = strings.Split(base64Image, ",")[1]
-						}
-						
-						imageData, err := base64.StdEncoding.DecodeString(base64Data)
-						if err != nil {
-							log.Printf("Error decoding base64 image: %v", err)
-							conn.WriteJSON(WebSocketMessage{
-								Type:  "error",
-								Error: "Failed to decode image: " + err.Error(),
-							})
-							continue
-						}
-						
-						err = os.WriteFile(imagePath, imageData, 0644)
-						if err != nil {
-							log.Printf("Error saving image file: %v", err)
-							conn.WriteJSON(WebSocketMessage{
-								Type:  "error",
-								Error: "Failed to save image: " + err.Error(),
-							})
-							continue
-						}
-
-						img := Image{
-							Filename:  filename,
-							MessageID: message.ID,
-							Status:    "generated",
-						}
-						db.Create(&img)
-
-						savedImages = append(savedImages, filename)
-					}
-
-					message.IsGenerated = true
-					db.Save(&message)
-
-					// Отправляем результат обратно клиенту
-					err = conn.WriteJSON(WebSocketMessage{
-						Type:   "result",
-						Status: "success",
-						Data:   msg.Data,
-						Image:  savedImages[0], // Отправляем первое изображение
-					})
-					if err != nil {
-						log.Printf("Error sending WebSocket message: %v", err)
-					}
-
-				default:
-					conn.WriteJSON(WebSocketMessage{
-						Type:  "error",
-						Error: "Unknown message type",
-					})
-				}
-			}
-		}
-	}()
-
-	// Ping механизм для поддержания соединения
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Отправляем ping для поддержания соединения
-			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				log.Printf("Ping error: %v", err)
-				return
-			}
-		}
-	}
 }
 
 func serveImage(w http.ResponseWriter, r *http.Request) {
