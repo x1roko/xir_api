@@ -383,30 +383,8 @@ func GetMessageHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Группируем изображения по диалогам
-	dialogHistory := []DialogHistoryItem{}
-	for i := 0; i < len(userImages); i++ {
-		// Находим запрос пользователя (is_user = true)
-		if userImages[i].IsUser {
-			userRequest := userImages[i]
-			
-			// Ищем соответствующее изображение, сгенерированное системой
-			var systemImage Image
-			systemResult := db.Where("user_id = ? AND is_user = ? AND created_at > ? AND created_at < ?", 
-				userID, false, userRequest.CreatedAt, userRequest.CreatedAt.Add(5*time.Minute)).First(&systemImage)
-			
-			if systemResult.Error == nil {
-				dialogHistory = append(dialogHistory, DialogHistoryItem{
-					UserRequest: userRequest,
-					SystemImage: systemImage,
-					CreatedAt:   userRequest.CreatedAt,
-				})
-			}
-		}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(dialogHistory)
+	json.NewEncoder(w).Encode(userImages)
 }
 
 func waitForGenerationCompletion(uuid string) ([]string, error) {
