@@ -61,28 +61,28 @@ type WebSocketMessage struct {
 
 type Message struct {
 	gorm.Model
-	UserID      uint    `gorm:"index"`
-	Prompt      string  `json:"prompt"`
-	IsGenerated bool    `json:"is_generated"`
+	UserID      uint   `gorm:"index"`
+	Prompt      string `json:"prompt"`
+	IsGenerated bool   `json:"is_generated"`
 	CreatedAt   time.Time
 }
 
 type Image struct {
-	Filename    string `gorm:"primaryKey" json:"filename"`
-	UserID      uint   `gorm:"index" json:"user_id"`
-	Prompt      string `json:"prompt"`
-	IsUser      bool   `json:"is_user"`
-	Width       int    `json:"width"`
-	Height      int    `json:"height"`
-	Style       string `json:"style"`
+	Filename       string `gorm:"primaryKey" json:"filename"`
+	UserID         uint   `gorm:"index" json:"user_id"`
+	Prompt         string `json:"prompt"`
+	IsUser         bool   `json:"is_user"`
+	Width          int    `json:"width"`
+	Height         int    `json:"height"`
+	Style          string `json:"style"`
 	NegativePrompt string `json:"negative_prompt"`
-	Status      string `json:"status"`
-	CreatedAt   time.Time
+	Status         string `json:"status"`
+	CreatedAt      time.Time
 }
 
 type DialogHistoryItem struct {
-	UserRequest Image   `json:"user_request"`
-	SystemImage Image   `json:"system_image"`
+	UserRequest Image     `json:"user_request"`
+	SystemImage Image     `json:"system_image"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -201,21 +201,21 @@ func GenerateImage(w http.ResponseWriter, r *http.Request) {
 	var savedImages []string
 	for idx, base64Image := range images {
 		filename := fmt.Sprintf("image_%s_%d_%d.png", uuid, time.Now().UnixNano(), idx)
-		
+
 		imagePath := filepath.Join(os.Getenv("IMAGES_STORAGE_PATH"), filename)
-		
+
 		// Удаляем префикс base64, если он есть
 		base64Data := base64Image
 		if strings.Contains(base64Image, ",") {
 			base64Data = strings.Split(base64Image, ",")[1]
 		}
-		
+
 		imageData, err := base64.StdEncoding.DecodeString(base64Data)
 		if err != nil {
 			log.Printf("Error decoding base64 image: %v", err)
 			continue
 		}
-		
+
 		err = os.WriteFile(imagePath, imageData, 0644)
 		if err != nil {
 			log.Printf("Error saving image file: %v", err)
@@ -224,15 +224,15 @@ func GenerateImage(w http.ResponseWriter, r *http.Request) {
 
 		// Создаем запись в базе данных
 		img := Image{
-			Filename:        filename,
-			UserID:          uint(userID),
-			Prompt:          kandinskyReq.Prompt,
-			IsUser:          true,
-			Width:           kandinskyReq.Width,
-			Height:          kandinskyReq.Height,
-			Style:           kandinskyReq.Style,
-			NegativePrompt:  kandinskyReq.NegativePrompt,
-			Status:          "generated",
+			Filename:       filename,
+			UserID:         uint(userID),
+			Prompt:         kandinskyReq.Prompt,
+			IsUser:         true,
+			Width:          kandinskyReq.Width,
+			Height:         kandinskyReq.Height,
+			Style:          kandinskyReq.Style,
+			NegativePrompt: kandinskyReq.NegativePrompt,
+			Status:         "generated",
 		}
 		db.Create(&img)
 
@@ -293,21 +293,21 @@ func HandleWebSocketImageGeneration(w http.ResponseWriter, r *http.Request) {
 			var savedImages []string
 			for idx, base64Image := range images {
 				filename := fmt.Sprintf("image_%s_%d_%d.png", uuid, time.Now().UnixNano(), idx)
-				
+
 				imagePath := filepath.Join(os.Getenv("IMAGES_STORAGE_PATH"), filename)
-				
+
 				// Удаляем префикс base64, если он есть
 				base64Data := base64Image
 				if strings.Contains(base64Image, ",") {
 					base64Data = strings.Split(base64Image, ",")[1]
 				}
-				
+
 				imageData, err := base64.StdEncoding.DecodeString(base64Data)
 				if err != nil {
 					log.Printf("Error decoding base64 image: %v", err)
 					continue
 				}
-				
+
 				err = os.WriteFile(imagePath, imageData, 0644)
 				if err != nil {
 					log.Printf("Error saving image file: %v", err)
@@ -316,15 +316,15 @@ func HandleWebSocketImageGeneration(w http.ResponseWriter, r *http.Request) {
 
 				// Создаем запись в базе данных
 				img := Image{
-					Filename:        filename,
-					UserID:          uint(userIDUint),
-					Prompt:          msg.Data.Prompt,
-					IsUser:          false, // Сгенерировано системой
-					Width:           msg.Data.Width,
-					Height:          msg.Data.Height,
-					Style:           msg.Data.Style,
-					NegativePrompt:  msg.Data.NegativePrompt,
-					Status:          "generated",
+					Filename:       filename,
+					UserID:         uint(userIDUint),
+					Prompt:         msg.Data.Prompt,
+					IsUser:         false, // Сгенерировано системой
+					Width:          msg.Data.Width,
+					Height:         msg.Data.Height,
+					Style:          msg.Data.Style,
+					NegativePrompt: msg.Data.NegativePrompt,
+					Status:         "generated",
 				}
 				db.Create(&img)
 
@@ -377,7 +377,7 @@ func GetMessageHistory(w http.ResponseWriter, r *http.Request) {
 
 	// Получаем все изображения пользователя
 	var userImages []Image
-	result := db.Where("user_id = ?", userID).Order("created_at DESC").Find(&userImages)
+	result := db.Where("user_id = ?", userID).Order("created_at ASC").Find(&userImages)
 	if result.Error != nil {
 		http.Error(w, "Failed to retrieve images", http.StatusInternalServerError)
 		return
@@ -422,7 +422,7 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 			"query": req.Prompt,
 		},
 	}
-	
+
 	if req.Style != "" {
 		params["style"] = req.Style
 	}
