@@ -28,3 +28,12 @@ services:
     volumes:
       - ./images:/app/images
       - ./.env:/app/.env 
+
+  configs-service:
+    build:
+      context: ./services/configs-service
+      dockerfile: Dockerfile
+    ports:
+      - "8084:8084"
+    volumes:
+      - ./.env:/app/.env 
