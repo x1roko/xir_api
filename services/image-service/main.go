@@ -44,11 +44,13 @@ type KandinskyResponse struct {
 }
 
 type CheckStatusResponse struct {
-	UUID             string   `json:"uuid"`
-	Status           string   `json:"status"`
-	Images           []string `json:"images"`
-	ErrorDescription string   `json:"errorDescription"`
-	Censored         bool     `json:"censored"`
+	UUID             string `json:"uuid"`
+	Status           string `json:"status"`
+	ErrorDescription string `json:"errorDescription"`
+	Result           struct {
+		Files    []string `json:"files"`
+		Censored bool     `json:"censored"`
+	} `json:"result"`
 }
 
 type WebSocketMessage struct {
@@ -388,8 +390,8 @@ func GetMessageHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func waitForGenerationCompletion(uuid string) ([]string, error) {
-	const maxAttempts = 100
-	const delay = 5 * time.Second
+	const maxAttempts = 200
+	const delay = 10 * time.Second
 
 	for i := 0; i < maxAttempts; i++ {
 		images, err := checkGenerationStatus(uuid)
@@ -408,9 +410,15 @@ func waitForGenerationCompletion(uuid string) ([]string, error) {
 }
 
 func callKandinskyAPI(req KandinskyRequest) (string, error) {
-	url := "https://api-key.fusionbrain.ai/key/api/v1/text2image/run"
+	baseURL := "https://api-key.fusionbrain.ai/"
 	apiKey := os.Getenv("KANDINSKY_API_KEY")
 	secretKey := os.Getenv("KANDINSKY_SECRET_KEY")
+
+	// Get the pipeline ID
+	pipelineID, err := getPipelineID(baseURL, apiKey, secretKey)
+	if err != nil {
+		return "", err
+	}
 
 	params := map[string]interface{}{
 		"type":      "GENERATE",
@@ -418,7 +426,6 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 		"width":     req.Width,
 		"height":    req.Height,
 		"numImages": req.Images,
-		//"model_id":  4, // Захардкоженная модель
 		"generateParams": map[string]interface{}{
 			"query": req.Prompt,
 		},
@@ -428,7 +435,7 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 		params["style"] = req.Style
 	}
 	if req.NegativePrompt != "" {
-		params["negativePromptUnclip"] = req.NegativePrompt
+		params["negativePromptDecoder"] = req.NegativePrompt
 	}
 
 	jsonValue, err := json.Marshal(params)
@@ -440,15 +447,15 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 
 	var body bytes.Buffer
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-	body.WriteString("Content-Disposition: form-data; name=\"model_id\"\r\n\r\n")
-	body.WriteString("4\r\n") // Захардкоженная модель
+	body.WriteString("Content-Disposition: form-data; name=\"pipeline_id\"\r\n\r\n")
+	body.WriteString(pipelineID + "\r\n")
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	body.WriteString("Content-Disposition: form-data; name=\"params\"\r\n")
 	body.WriteString("Content-Type: application/json\r\n\r\n")
 	body.WriteString(string(jsonValue) + "\r\n")
 	body.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
 
-	request, err := http.NewRequest("POST", url, &body)
+	request, err := http.NewRequest("POST", baseURL+"key/api/v1/pipeline/run", &body)
 	if err != nil {
 		return "", err
 	}
@@ -477,8 +484,39 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 	return generateResponse.UUID, nil
 }
 
+func getPipelineID(baseURL, apiKey, secretKey string) (string, error) {
+	client := &http.Client{}
+	request, err := http.NewRequest("GET", baseURL+"key/api/v1/pipelines", nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("X-Key", "Key "+apiKey)
+	request.Header.Set("X-Secret", "Secret "+secretKey)
+
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to get pipeline ID, status code: %d", response.StatusCode)
+	}
+
+	var pipelines []map[string]interface{}
+	if err := json.NewDecoder(response.Body).Decode(&pipelines); err != nil {
+		return "", err
+	}
+
+	if len(pipelines) == 0 {
+		return "", fmt.Errorf("no pipelines found")
+	}
+
+	return pipelines[0]["id"].(string), nil
+}
+
 func checkGenerationStatus(uuid string) ([]string, error) {
-	url := fmt.Sprintf("https://api-key.fusionbrain.ai/key/api/v1/text2image/status/%s", uuid)
+	url := fmt.Sprintf("https://api-key.fusionbrain.ai/key/api/v1/pipeline/status/%s", uuid)
 	apiKey := os.Getenv("KANDINSKY_API_KEY")
 	secretKey := os.Getenv("KANDINSKY_SECRET_KEY")
 
@@ -496,21 +534,31 @@ func checkGenerationStatus(uuid string) ([]string, error) {
 	}
 	defer response.Body.Close()
 
-	var statusResponse CheckStatusResponse
-	if err := json.NewDecoder(response.Body).Decode(&statusResponse); err != nil {
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
 		return nil, err
 	}
+	log.Printf("Kandinsky Status Response (raw): %s, Status Code: %d", string(responseBody), response.StatusCode)
 
-	log.Printf("Kandinsky Status Response: %+v", statusResponse)
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Kandinsky status API error: %s (status: %d)", string(responseBody), response.StatusCode)
+	}
+
+	var statusResponse CheckStatusResponse
+	if err := json.Unmarshal(responseBody, &statusResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse Kandinsky status response: %v, body: %s", err, string(responseBody))
+	}
+
+	log.Printf("Kandinsky Status Response (parsed): %+v", statusResponse)
 
 	if statusResponse.Status == "DONE" {
-		for i, imageData := range statusResponse.Images {
+		for i, imageData := range statusResponse.Result.Files { // Используем Result.Files вместо Images
 			filename := fmt.Sprintf("/app/images/image_%s_%d.png", uuid, i)
 			if err := saveBase64Image(imageData, filename); err != nil {
 				return nil, err
 			}
 		}
-		return statusResponse.Images, nil
+		return statusResponse.Result.Files, nil // Возвращаем Result.Files
 	}
 
 	return nil, nil
