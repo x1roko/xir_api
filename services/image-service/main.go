@@ -414,10 +414,11 @@ func callKandinskyAPI(req KandinskyRequest) (string, error) {
 
 	params := map[string]interface{}{
 		"type":      "GENERATE",
-		"numImages": req.Images,
+		"style":     req.Style,
 		"width":     req.Width,
 		"height":    req.Height,
-		"model_id":  4, // Захардкоженная модель
+		"numImages": req.Images,
+		//"model_id":  4, // Захардкоженная модель
 		"generateParams": map[string]interface{}{
 			"query": req.Prompt,
 		},
