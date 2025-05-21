@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,12 +20,38 @@ import (
 	"gorm.io/gorm"
 )
 
+// JSONSlice представляет срез строк, который может быть сохранен в базе данных как JSON
+type JSONSlice []string
+
+// Scan реализует интерфейс sql.Scanner
+func (j *JSONSlice) Scan(value interface{}) error {
+	if value == nil {
+		*j = make(JSONSlice, 0)
+		return nil
+	}
+
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("type assertion to []byte failed")
+	}
+
+	return json.Unmarshal(bytes, j)
+}
+
+// Value реализует интерфейс driver.Valuer
+func (j JSONSlice) Value() (driver.Value, error) {
+	if len(j) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(j)
+}
+
 type Model struct {
 	ID          uint      `json:"id" gorm:"primaryKey"`
-	Name        string    `json:"name" gorm:"uniqueIndex"`
+	Name        string    `json:"name" gorm:"type:varchar(255);uniqueIndex"`
 	Description string    `json:"description"`
 	Parameters  string    `json:"parameters"`
-	Tags        []string  `json:"tags" gorm:"type:json"`
+	Tags        JSONSlice `json:"tags" gorm:"type:json"` // Используем кастомный тип
 	OllamaTag   string    `json:"ollama_tag"`
 	Pulls       int64     `json:"pulls"`
 	UpdatedAt   time.Time `json:"updated_at"`
@@ -220,13 +247,14 @@ func GetModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if models == nil {
-		if err := db.Find(&models).Error; err != nil {
+		var modelsFromDB []Model
+		if err := db.Find(&modelsFromDB).Error; err != nil {
 			log.Printf("Error getting models from DB: %v", err)
 			http.Error(w, fmt.Sprintf("Error getting models: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		if err := cacheClient.SetModels(r.Context(), models); err != nil {
+		if err := cacheClient.SetModels(r.Context(), modelsFromDB); err != nil {
 			log.Printf("Failed to cache models: %v", err)
 		}
 
@@ -237,6 +265,8 @@ func GetModels(w http.ResponseWriter, r *http.Request) {
 		}).Error; err != nil {
 			log.Printf("Failed to create model operation: %v", err)
 		}
+
+		models = modelsFromDB
 	}
 
 	if err := json.NewEncoder(w).Encode(models); err != nil {
