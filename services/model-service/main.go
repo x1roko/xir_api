@@ -20,13 +20,15 @@ import (
 )
 
 type Model struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Size        string   `json:"size"`
-	Parameters  string   `json:"parameters"`
-	Tags        []string `json:"tags"`
-	OllamaTag   string   `json:"ollama_tag"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	Name        string    `json:"name" gorm:"uniqueIndex"`
+	Description string    `json:"description"`
+	Parameters  string    `json:"parameters"`
+	Tags        []string  `json:"tags" gorm:"type:json"`
+	OllamaTag   string    `json:"ollama_tag"`
+	Pulls       int64     `json:"pulls"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type ModelOperation struct {
@@ -35,233 +37,6 @@ type ModelOperation struct {
 	ModelName string    `json:"model_name"`
 	Operation string    `json:"operation"`
 	CreatedAt time.Time `json:"created_at"`
-}
-
-type HFClient struct {
-	BaseURL string
-	Token   string
-}
-
-func NewHFClient(baseURL, token string) *HFClient {
-	return &HFClient{BaseURL: baseURL, Token: token}
-}
-
-func (c *HFClient) GetModels(filterTags []string, maxSize, minParameters string) ([]Model, error) {
-	url := c.BaseURL + "/models?filter=gguf"
-	if len(filterTags) > 0 {
-		url += "&tags=" + strings.Join(filterTags, ",")
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var hfModels []struct {
-		ID          string   `json:"id"`
-		Tags        []string `json:"tags"`
-		PipelineTag string   `json:"pipeline_tag"`
-		CreatedAt   string   `json:"createdAt"`
-		Downloads   int      `json:"downloads"`
-		Likes       int      `json:"likes"`
-		Private     bool     `json:"private"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&hfModels); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
-	}
-
-	var models []Model
-	for _, m := range hfModels {
-		if contains(m.Tags, "gguf") {
-			// Используем доступные поля из API
-			description := fmt.Sprintf("Downloads: %d, Likes: %d, Created: %s",
-				m.Downloads, m.Likes, m.CreatedAt)
-
-			// Пытаемся извлечь параметры из тегов
-			parameters := extractParametersFromTags(m.Tags)
-
-			models = append(models, Model{
-				ID:          m.ID,
-				Name:        m.ID,
-				Description: description,
-				Size:        "N/A", // Размер не доступен в API
-				Parameters:  parameters,
-				Tags:        m.Tags,
-				OllamaTag:   mapToOllamaTag(m.ID),
-			})
-		}
-	}
-
-	return models, nil
-}
-
-func extractParametersFromTags(tags []string) string {
-	for _, tag := range tags {
-		if strings.Contains(tag, "B") && !strings.Contains(tag, "base_model") {
-			// Пытаемся найти тег с параметрами модели (например, "7B")
-			return tag
-		}
-	}
-	return ""
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-func formatSize(bytes int64) string {
-	const (
-		GB = 1 << 30
-		MB = 1 << 20
-		KB = 1 << 10
-	)
-
-	if bytes >= GB {
-		return fmt.Sprintf("%.1f GB", float64(bytes)/float64(GB))
-	}
-	if bytes >= MB {
-		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(MB))
-	}
-	if bytes >= KB {
-		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(KB))
-	}
-	return fmt.Sprintf("%d B", bytes)
-}
-
-func mapToOllamaTag(id string) string {
-	// Разделяем строку по "/"
-	parts := strings.Split(id, "/")
-	if len(parts) > 1 {
-		// Берем последнюю часть (имя модели)
-		name := parts[len(parts)-1]
-
-		// Находим первое слово до "-"
-		if index := strings.Index(name, "-"); index != -1 {
-			return strings.ToLower(name[:index])
-		}
-
-		// Если нет "-", возвращаем всё имя в нижнем регистре
-		return strings.ToLower(name)
-	}
-
-	// Если нет "/", просто берем первое слово до "-"
-	if index := strings.Index(id, "-"); index != -1 {
-		return strings.ToLower(id[:index])
-	}
-
-	// Если нет ни "-", ни "/", возвращаем всё имя в нижнем регистре
-	return strings.ToLower(id)
-}
-
-func sizeMeetsRequirement(size, maxSize string) bool {
-	if size == "N/A" || maxSize == "" {
-		return true
-	}
-
-	sizeVal, err := parseSize(size)
-	if err != nil {
-		log.Printf("Invalid size format: %v", err)
-		return false
-	}
-
-	maxSizeVal, err := parseSize(maxSize)
-	if err != nil {
-		log.Printf("Invalid max_size format: %v", err)
-		return false
-	}
-
-	return sizeVal <= maxSizeVal
-}
-
-func parametersMeetRequirement(params, minParams string) bool {
-	if params == "" || minParams == "" {
-		return true
-	}
-
-	paramsVal, err := parseParameters(params)
-	if err != nil {
-		log.Printf("Invalid parameters format: %v", err)
-		return false
-	}
-
-	minParamsVal, err := parseParameters(minParams)
-	if err != nil {
-		log.Printf("Invalid min_parameters format: %v", err)
-		return false
-	}
-
-	return paramsVal >= minParamsVal
-}
-
-func parseSize(size string) (float64, error) {
-	size = strings.TrimSpace(size)
-	if size == "" || size == "N/A" {
-		return 0, nil
-	}
-
-	var val float64
-	if strings.HasSuffix(size, "GB") {
-		_, err := fmt.Sscanf(size, "%f GB", &val)
-		return val * 1024, err // Convert GB to MB
-	}
-	if strings.HasSuffix(size, "MB") {
-		_, err := fmt.Sscanf(size, "%f MB", &val)
-		return val, err
-	}
-	if strings.HasSuffix(size, "KB") {
-		_, err := fmt.Sscanf(size, "%f KB", &val)
-		return val / 1024, err // Convert KB to MB
-	}
-	if strings.HasSuffix(size, "B") {
-		_, err := fmt.Sscanf(size, "%f B", &val)
-		return val / (1024 * 1024), err // Convert B to MB
-	}
-	return 0, fmt.Errorf("invalid size format: %s", size)
-}
-
-func parseParameters(params string) (float64, error) {
-	params = strings.TrimSpace(params)
-	if params == "" {
-		return 0, nil
-	}
-
-	var val float64
-	if strings.HasSuffix(params, "B") {
-		_, err := fmt.Sscanf(params, "%fB", &val)
-		return val, err
-	}
-	if strings.Contains(params, "B") {
-		// Handle cases like "7B" without space
-		parts := strings.Split(params, "B")
-		if len(parts) > 0 {
-			val, err := strconv.ParseFloat(parts[0], 64)
-			if err != nil {
-				return 0, fmt.Errorf("invalid parameters format: %s", params)
-			}
-			return val, nil
-		}
-	}
-	return 0, fmt.Errorf("invalid parameters format: %s", params)
 }
 
 type RedisCache struct {
@@ -298,10 +73,29 @@ func (c *RedisCache) SetModels(ctx context.Context, models []Model) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal models for cache: %v", err)
 	}
-	if err := c.client.Set(ctx, "models", data, 24*time.Hour).Err(); err != nil {
+	if err := c.client.Set(ctx, "models", data, time.Hour).Err(); err != nil {
 		return fmt.Errorf("failed to set models in cache: %v", err)
 	}
 	return nil
+}
+
+func (c *RedisCache) GetLastSyncTime(ctx context.Context) (time.Time, error) {
+	val, err := c.client.Get(ctx, "last_sync").Result()
+	if err == redis.Nil {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get last sync time: %v", err)
+	}
+	t, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse last sync time: %v", err)
+	}
+	return t, nil
+}
+
+func (c *RedisCache) SetLastSyncTime(ctx context.Context, t time.Time) error {
+	return c.client.Set(ctx, "last_sync", t.Format(time.RFC3339), 0).Err()
 }
 
 var (
@@ -350,6 +144,34 @@ func authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func syncModelsToRedis() {
+	cacheClient := NewRedisCache(os.Getenv("REDIS_ADDR"), "", 0)
+	ctx := context.Background()
+
+	for {
+		lastSync, err := cacheClient.GetLastSyncTime(ctx)
+		if err != nil {
+			log.Printf("Failed to get last sync time: %v", err)
+		}
+
+		if lastSync.IsZero() || time.Since(lastSync) >= time.Hour {
+			var models []Model
+			if err := db.Find(&models).Error; err != nil {
+				log.Printf("Failed to fetch models from DB: %v", err)
+			} else {
+				if err := cacheClient.SetModels(ctx, models); err != nil {
+					log.Printf("Failed to cache models: %v", err)
+				}
+				if err := cacheClient.SetLastSyncTime(ctx, time.Now()); err != nil {
+					log.Printf("Failed to set last sync time: %v", err)
+				}
+				log.Printf("Synced %d models to Redis", len(models))
+			}
+		}
+		time.Sleep(time.Hour)
+	}
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
@@ -370,14 +192,15 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	if err := db.AutoMigrate(&ModelOperation{}); err != nil {
+	if err := db.AutoMigrate(&ModelOperation{}, &Model{}); err != nil {
 		log.Fatalf("Failed to auto migrate database: %v", err)
 	}
+
+	go syncModelsToRedis()
 
 	router := mux.NewRouter()
 	router.Use(corsMiddleware)
 	router.HandleFunc("/models", GetModels).Methods("GET", "OPTIONS")
-	router.HandleFunc("/models/filter", FilterModels).Methods("GET", "OPTIONS")
 	router.HandleFunc("/operations", authenticate(GetOperations)).Methods("GET", "OPTIONS")
 
 	log.Println("Model service running on 0.0.0.0:8085")
@@ -397,10 +220,8 @@ func GetModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if models == nil {
-		hfClient := NewHFClient(os.Getenv("HF_API_URL"), os.Getenv("HF_TOKEN"))
-		models, err = hfClient.GetModels(nil, "", "")
-		if err != nil {
-			log.Printf("Error getting models from Hugging Face API: %v", err)
+		if err := db.Find(&models).Error; err != nil {
+			log.Printf("Error getting models from DB: %v", err)
 			http.Error(w, fmt.Sprintf("Error getting models: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -420,86 +241,6 @@ func GetModels(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(models); err != nil {
 		log.Printf("Failed to encode models: %v", err)
-	}
-}
-
-func FilterModels(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	w.Header().Set("Content-Type", "application/json")
-
-	query := r.URL.Query()
-	tags := strings.Split(query.Get("tags"), ",")
-	if len(tags) == 1 && tags[0] == "" {
-		tags = nil
-	}
-	maxSize := query.Get("max_size")
-	minParameters := query.Get("min_parameters")
-
-	cacheClient := NewRedisCache(os.Getenv("REDIS_ADDR"), "", 0)
-	cacheKey := fmt.Sprintf("models:%s:%s:%s", strings.Join(tags, ","), maxSize, minParameters)
-
-	val, err := cacheClient.client.Get(r.Context(), cacheKey).Result()
-	if err == redis.Nil {
-		hfClient := NewHFClient(os.Getenv("HF_API_URL"), os.Getenv("HF_TOKEN"))
-		models, err := hfClient.GetModels(tags, maxSize, minParameters)
-		if err != nil {
-			log.Printf("Error getting filtered models from Hugging Face API: %v", err)
-			http.Error(w, fmt.Sprintf("Error getting filtered models: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Фильтруем модели по параметрам
-		var filteredModels []Model
-		for _, model := range models {
-			if maxSize != "" && !sizeMeetsRequirement(model.Size, maxSize) {
-				continue
-			}
-			if minParameters != "" && !parametersMeetRequirement(model.Parameters, minParameters) {
-				continue
-			}
-			filteredModels = append(filteredModels, model)
-		}
-
-		data, err := json.Marshal(filteredModels)
-		if err != nil {
-			log.Printf("Error marshaling filtered models: %v", err)
-			http.Error(w, fmt.Sprintf("Error marshaling filtered models: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		if err := cacheClient.client.Set(r.Context(), cacheKey, data, 24*time.Hour).Err(); err != nil {
-			log.Printf("Failed to cache filtered models: %v", err)
-		}
-
-		if err := json.NewEncoder(w).Encode(filteredModels); err != nil {
-			log.Printf("Failed to encode filtered models: %v", err)
-		}
-
-		if err := db.Create(&ModelOperation{
-			UserID:    0,
-			ModelName: "filtered",
-			Operation: "filter",
-		}).Error; err != nil {
-			log.Printf("Failed to create model operation: %v", err)
-		}
-		return
-	}
-
-	if err != nil {
-		log.Printf("Error getting filtered models from cache: %v", err)
-		http.Error(w, fmt.Sprintf("Error getting filtered models: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	var models []Model
-	if err := json.Unmarshal([]byte(val), &models); err != nil {
-		log.Printf("Error unmarshaling filtered models from cache: %v", err)
-		http.Error(w, fmt.Sprintf("Error unmarshaling filtered models: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(models); err != nil {
-		log.Printf("Failed to encode filtered models: %v", err)
 	}
 }
 
