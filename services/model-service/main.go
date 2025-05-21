@@ -149,16 +149,27 @@ func formatSize(bytes int64) string {
 }
 
 func mapToOllamaTag(id string) string {
+	// Разделяем строку по "/"
 	parts := strings.Split(id, "/")
 	if len(parts) > 1 {
-		name := strings.ToLower(parts[1])
-		name = strings.ReplaceAll(name, "llama-", "llama")
-		name = strings.ReplaceAll(name, "-gguf", "")
-		name = strings.ReplaceAll(name, "_gguf", "")
-		name = strings.ReplaceAll(name, ".gguf", "")
-		name = strings.ReplaceAll(name, " ", "-")
-		return name
+		// Берем последнюю часть (имя модели)
+		name := parts[len(parts)-1]
+
+		// Находим первое слово до "-"
+		if index := strings.Index(name, "-"); index != -1 {
+			return strings.ToLower(name[:index])
+		}
+
+		// Если нет "-", возвращаем всё имя в нижнем регистре
+		return strings.ToLower(name)
 	}
+
+	// Если нет "/", просто берем первое слово до "-"
+	if index := strings.Index(id, "-"); index != -1 {
+		return strings.ToLower(id[:index])
+	}
+
+	// Если нет ни "-", ни "/", возвращаем всё имя в нижнем регистре
 	return strings.ToLower(id)
 }
 
